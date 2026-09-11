@@ -1,0 +1,5 @@
+print("Hello Python! 🐍")
+print("My name is Saara 💙")
+print("I am a CSE student 👩‍💻")
+print("I don't feel like studying today 😂")
+print("But I am going to become an AI expert 🤖🔥")

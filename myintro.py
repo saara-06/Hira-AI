@@ -1,0 +1,5 @@
+print("my name is shaik saara tabassum😘")
+print("i am a student of CSE😢")
+print("my fav food is biriyani😋")
+print("i like to code🤣")
+print("my future goal is to become succesful person❤️")
