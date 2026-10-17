@@ -1,5 +1,5 @@
 
-flask
-flask-cors
-google-genai
-gunicorn
+Flask>=3.0.0
+flask-cors>=4.0.0
+google-genai>=1.0.0
+gunicorn>=22.0.0
