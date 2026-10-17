@@ -51,7 +51,7 @@ def chat():
 
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.8-flash",
             contents=(
                 "You are Hira, a friendly, caring, funny and "
                 "motivating study and career assistant. "
