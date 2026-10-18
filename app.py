@@ -8,11 +8,13 @@ from threading import Lock
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from google import genai
+from google.genai import types
+
+# ---------------- APP CONFIG ----------------
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
-# Allowed frontend websites
 FRONTEND_ORIGINS = [
     "https://saara-06.github.io",
     "https://edufamily-ai.vercel.app",
@@ -20,7 +22,6 @@ FRONTEND_ORIGINS = [
     "http://127.0.0.1:5500",
 ]
 
-# CORS enabled for chat, history, health and other routes
 CORS(
     app,
     resources={r"/*": {"origins": FRONTEND_ORIGINS}},
@@ -29,21 +30,29 @@ CORS(
     supports_credentials=False,
 )
 
-# Render environment variables
 API_KEY = os.environ.get("GEMINI_API_KEY")
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
 
 DB_PATH = os.environ.get(
     "HIRA_DB_PATH",
-    str(Path(__file__).resolve().parent / "hira_history.db")
+    str(Path(__file__).resolve().parent / "hira_history.db"),
 )
 
-client = genai.Client(api_key=API_KEY) if API_KEY else None
+# 90-second HTTP timeout for Gemini requests
+client = (
+    genai.Client(
+        api_key=API_KEY,
+        http_options=types.HttpOptions(timeout=90000),
+    )
+    if API_KEY
+    else None
+)
+
 db_lock = Lock()
 
 SYSTEM_INSTRUCTIONS = """
-You are Hira AI, a friendly, caring, funny, motivating study
-and career assistant.
+You are Hira AI, a friendly, caring, funny, motivating
+and smart study and career assistant.
 
 Known context:
 - The user's name is Shaik Saara Tabassum.
@@ -62,8 +71,7 @@ Instructions:
   SQL, AI and debugging.
 - Help with study notes, quizzes, exam answers, career
   roadmaps and interviews.
-- When practical, provide complete working code instead
-  of disconnected snippets.
+- Provide complete working code when practical.
 - Be honest if information is missing.
 - Never pretend to remember a different chat.
 - Never reveal API keys, credentials or secrets.
@@ -131,16 +139,6 @@ def save_message(session_id, role, text):
 
     with db_lock:
         with database() as con:
-            con.execute(
-                """
-                INSERT INTO messages
-                (session_id, role, text, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
-                (session_id, role, text, now),
-            )
-
-            # Keep the first message as the chat title.
             if role == "user":
                 title = " ".join(text.split())[:48] or "New chat"
 
@@ -157,17 +155,78 @@ def save_message(session_id, role, text):
             else:
                 con.execute(
                     """
-                    UPDATE sessions
-                    SET updated_at = ?
-                    WHERE session_id = ?
+                    INSERT INTO sessions
+                    (session_id, title, updated_at)
+                    VALUES (?, 'New chat', ?)
+                    ON CONFLICT(session_id)
+                    DO UPDATE SET updated_at = excluded.updated_at
                     """,
-                    (now, session_id),
+                    (session_id, now),
                 )
+
+            con.execute(
+                """
+                INSERT INTO messages
+                (session_id, role, text, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (session_id, role, text, now),
+            )
 
             con.commit()
 
 
 initialize_database()
+
+# ---------------- GEMINI RETRY ----------------
+
+def generate_with_retry(contents):
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+
+    for attempt in range(3):
+        try:
+            return client.models.generate_content(
+                model=MODEL,
+                contents=contents,
+                config={
+                    "system_instruction": SYSTEM_INSTRUCTIONS,
+                },
+            )
+
+        except Exception as error:
+            error_text = str(error).upper()
+
+            temporary_error = any(
+                code in error_text
+                for code in (
+                    "503",
+                    "UNAVAILABLE",
+                    "429",
+                    "RESOURCE_EXHAUSTED",
+                    "500",
+                    "502",
+                    "504",
+                    "INTERNAL",
+                    "HIGH DEMAND",
+                )
+            )
+
+            if not temporary_error or attempt == 2:
+                raise
+
+            delay = 2 ** (attempt + 1)
+
+            app.logger.warning(
+                "Temporary Gemini error; retry %s of 2 "
+                "after %s seconds.",
+                attempt + 1,
+                delay,
+            )
+
+            time.sleep(delay)
+
+    raise RuntimeError("Gemini request failed after retries.")
 
 # ---------------- ROUTES ----------------
 
@@ -278,13 +337,7 @@ def chat():
             "parts": [{"text": message}],
         })
 
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config={
-                "system_instruction": SYSTEM_INSTRUCTIONS,
-            },
-        )
+        response = generate_with_retry(contents)
 
         reply = (response.text or "").strip()
 
@@ -294,7 +347,6 @@ def chat():
                 "Please try again."
             )
 
-        # Save messages only after the model request succeeds.
         save_message(session_id, "user", message)
         save_message(session_id, "model", reply)
 
@@ -306,12 +358,10 @@ def chat():
     except Exception as error:
         app.logger.exception("Hira AI request failed")
 
-        # Keep the real technical error in Render logs,
-        # not in the public response.
         return jsonify({
             "error": (
-                "Hira could not generate a reply. "
-                "Please try again."
+                "Gemini is temporarily unavailable or "
+                "could not complete the request. Please retry."
             ),
             "type": type(error).__name__,
         }), 502
