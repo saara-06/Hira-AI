@@ -13,15 +13,20 @@ from flask_cors import CORS
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 1 * 1024 * 1024
 
+# Allow the deployed frontend and local development.
 CORS(
     app,
-    resources={r"/*": {"origins": [
-        "https://saara-06.github.io",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:5000"
-    ]}},
-    supports_credentials=False
+    resources={
+        r"/*": {
+            "origins": [
+                "https://dainty-scone-7b3868.netlify.app",
+                "https://saara-06.github.io",
+                "http://localhost:8000",
+                "http://127.0.0.1:8000",
+                "http://localhost:5000"
+            ]
+        }
+    }
 )
 
 API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
@@ -39,7 +44,9 @@ MAX_HISTORY_MESSAGES = 20
 
 def get_db():
     connection = sqlite3.connect(
-        DATABASE_PATH, timeout=20, check_same_thread=False
+        DATABASE_PATH,
+        timeout=20,
+        check_same_thread=False
     )
     connection.row_factory = sqlite3.Row
     return connection
@@ -72,11 +79,15 @@ def save_message(session_id, role, content):
         connection = get_db()
         try:
             connection.execute(
-                """INSERT INTO messages
+                """
+                INSERT INTO messages
                 (session_id, role, content, created_at)
-                VALUES (?, ?, ?, ?)""",
+                VALUES (?, ?, ?, ?)
+                """,
                 (
-                    session_id, role, content,
+                    session_id,
+                    role,
+                    content,
                     datetime.now(timezone.utc).isoformat()
                 )
             )
@@ -90,10 +101,16 @@ def read_history(session_id, limit=MAX_HISTORY_MESSAGES):
         connection = get_db()
         try:
             rows = connection.execute(
-                """SELECT role, content, created_at FROM messages
-                WHERE session_id = ? ORDER BY id DESC LIMIT ?""",
+                """
+                SELECT role, content, created_at
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
                 (session_id, limit)
             ).fetchall()
+
             return [
                 {
                     "role": row["role"],
@@ -122,39 +139,48 @@ def delete_history(session_id):
 def call_openrouter(history, message):
     if not API_KEY:
         raise RuntimeError(
-            "OpenRouter API key is missing. Add OPENROUTER_API_KEY in Render."
+            "OPENROUTER_API_KEY is missing in Render environment settings."
         )
 
     system_prompt = """
-You are Hira AI, a friendly, helpful, smart AI study and career assistant.
+You are Hira AI, a friendly, smart, caring study and career assistant.
 
 PERSONALITY:
-- Be caring, encouraging, funny when appropriate, and slightly playful.
-- If the user speaks Hinglish or Roman Urdu, reply similarly.
-- If the user writes in English, reply in English.
-- Keep answers clear and useful without unnecessary length.
+- Be encouraging, funny when appropriate, and slightly playful.
+- Reply in Hinglish or Roman Urdu when the user uses that style.
+- Reply in English when the user writes in English.
+- Be clear, practical and friendly.
 
-WHAT YOU HELP WITH:
-- Python, Java, C, C++, HTML, CSS, JavaScript, SQL, DBMS and DSA.
-- AI, machine learning, beginner projects and debugging.
-- College assignments, exams, study plans, hackathons and internships.
+HELP WITH:
+Python, Java, C, C++, HTML, CSS, JavaScript, SQL, DBMS,
+DSA, AI, machine learning, college assignments, exams,
+projects, hackathons, career planning and internships.
 
-CODING RULES:
+CODING:
 - Provide complete runnable programs when requested.
-- Explain errors in simple steps.
-- Never claim code was tested or deployed unless it actually was.
-- Never reveal API keys or private configuration.
+- Explain technical problems in simple steps.
+- Never claim an action was completed unless it was.
+- Never expose secrets, API keys or private configuration.
 """
 
-    messages = [{"role": "system", "content": system_prompt}]
+    messages = [
+        {"role": "system", "content": system_prompt}
+    ]
 
     for item in history:
         role = item.get("role")
         content = item.get("content", "")
-        if role in ("user", "assistant") and content:
-            messages.append({"role": role, "content": content})
 
-    messages.append({"role": "user", "content": message})
+        if role in ("user", "assistant") and isinstance(content, str):
+            messages.append({
+                "role": role,
+                "content": content
+            })
+
+    messages.append({
+        "role": "user",
+        "content": message
+    })
 
     payload = {
         "model": MODEL,
@@ -169,7 +195,7 @@ CODING RULES:
         headers={
             "Authorization": "Bearer " + API_KEY,
             "Content-Type": "application/json",
-            "HTTP-Referer": "https://saara-06.github.io",
+            "HTTP-Referer": "https://dainty-scone-7b3868.netlify.app",
             "X-OpenRouter-Title": "Hira AI"
         },
         method="POST"
@@ -180,10 +206,14 @@ CODING RULES:
             result = json.loads(response.read().decode("utf-8"))
 
         choices = result.get("choices", [])
+
         if not choices:
-            raise RuntimeError("The AI returned no response. Please retry.")
+            raise RuntimeError(
+                "The AI provider returned no response. Please retry."
+            )
 
         answer = choices[0].get("message", {}).get("content", "")
+
         if isinstance(answer, list):
             answer = "\n".join(
                 part.get("text", "")
@@ -191,32 +221,56 @@ CODING RULES:
                 if isinstance(part, dict) and part.get("text")
             )
 
-        answer = answer.strip() if isinstance(answer, str) else ""
-        if not answer:
-            raise RuntimeError("Hira received an empty response. Please retry.")
+        if not isinstance(answer, str) or not answer.strip():
+            raise RuntimeError(
+                "The AI provider returned an empty response."
+            )
 
-        return answer
+        return answer.strip()
 
     except urllib.error.HTTPError as error:
         try:
             details = json.loads(error.read().decode("utf-8"))
-            message = details.get("error", {}).get("message")
-            if not message:
-                message = str(details.get("error", "API request failed"))
+            error_info = details.get("error", {})
+            provider_message = error_info.get(
+                "message", "The AI provider rejected the request."
+            )
         except Exception:
-            message = "OpenRouter returned HTTP " + str(error.code)
+            provider_message = "The AI provider rejected the request."
 
-        app.logger.error("OpenRouter HTTP %s: %s", error.code, message)
+        app.logger.error(
+            "OpenRouter HTTP %s: %s",
+            error.code,
+            provider_message
+        )
+
+        if error.code in (401, 403):
+            raise RuntimeError(
+                "OpenRouter authentication failed. Check the API key "
+                "in Render and make sure the key is valid."
+            )
+
+        if error.code == 429:
+            raise RuntimeError(
+                "OpenRouter rate limit reached. Please retry later "
+                "or check free-model availability."
+            )
+
         raise RuntimeError(
-            "OpenRouter request failed (HTTP " + str(error.code) +
-            "). Check your API key, free-model availability and rate limits."
+            "OpenRouter request failed with HTTP "
+            + str(error.code)
+            + ". Check the model and API limits."
         )
 
     except urllib.error.URLError:
-        raise RuntimeError("Could not connect to the AI service. Please retry.")
+        raise RuntimeError(
+            "Could not connect to OpenRouter. Please retry."
+        )
 
     except (TimeoutError, json.JSONDecodeError):
-        raise RuntimeError("The AI service timed out or returned invalid data.")
+        raise RuntimeError(
+            "The AI service timed out or returned invalid data."
+        )
 
 
 @app.route("/", methods=["GET"])
@@ -242,6 +296,7 @@ def health():
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
+
     message = data.get("message", "")
     session_id = data.get("session_id", "")
 
@@ -249,6 +304,7 @@ def chat():
         return jsonify({"error": "Message must be text."}), 400
 
     message = message.strip()
+
     if not message:
         return jsonify({"error": "Please enter a message."}), 400
 
@@ -259,6 +315,7 @@ def chat():
         return jsonify({"error": "A session ID is required."}), 400
 
     session_id = session_id.strip()
+
     if len(session_id) > 100:
         return jsonify({"error": "Invalid session ID."}), 400
 
@@ -269,14 +326,19 @@ def chat():
         save_message(session_id, "user", message)
         save_message(session_id, "assistant", reply)
 
-        return jsonify({"reply": reply, "session_id": session_id})
+        return jsonify({
+            "reply": reply,
+            "session_id": session_id
+        })
 
     except RuntimeError as error:
         return jsonify({"error": str(error)}), 503
 
     except Exception:
         app.logger.exception("Unexpected error in /chat")
-        return jsonify({"error": "Something went wrong. Please retry."}), 500
+        return jsonify({
+            "error": "Something went wrong on Hira's server."
+        }), 500
 
 
 @app.route("/history/<session_id>", methods=["GET"])
@@ -296,12 +358,18 @@ def clear_history(session_id):
         return jsonify({"error": "Invalid session ID."}), 400
 
     delete_history(session_id)
-    return jsonify({"success": True, "session_id": session_id})
+
+    return jsonify({
+        "success": True,
+        "session_id": session_id
+    })
 
 
 @app.errorhandler(413)
 def request_too_large(_error):
-    return jsonify({"error": "The request is too large."}), 413
+    return jsonify({
+        "error": "The request is too large."
+    }), 413
 
 
 init_db()
