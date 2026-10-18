@@ -2,7 +2,6 @@
 import os
 import json
 import sqlite3
-import time
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
@@ -25,13 +24,8 @@ CORS(
     supports_credentials=False
 )
 
-API_KEY = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("GOOGLE_API_KEY")
-    or ""
-).strip()
-
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
 
 DATABASE_PATH = os.getenv(
     "DATABASE_PATH",
@@ -45,9 +39,7 @@ MAX_HISTORY_MESSAGES = 20
 
 def get_db():
     connection = sqlite3.connect(
-        DATABASE_PATH,
-        timeout=20,
-        check_same_thread=False
+        DATABASE_PATH, timeout=20, check_same_thread=False
     )
     connection.row_factory = sqlite3.Row
     return connection
@@ -80,15 +72,11 @@ def save_message(session_id, role, content):
         connection = get_db()
         try:
             connection.execute(
-                """
-                INSERT INTO messages
+                """INSERT INTO messages
                 (session_id, role, content, created_at)
-                VALUES (?, ?, ?, ?)
-                """,
+                VALUES (?, ?, ?, ?)""",
                 (
-                    session_id,
-                    role,
-                    content,
+                    session_id, role, content,
                     datetime.now(timezone.utc).isoformat()
                 )
             )
@@ -102,16 +90,10 @@ def read_history(session_id, limit=MAX_HISTORY_MESSAGES):
         connection = get_db()
         try:
             rows = connection.execute(
-                """
-                SELECT role, content, created_at
-                FROM messages
-                WHERE session_id = ?
-                ORDER BY id DESC
-                LIMIT ?
-                """,
+                """SELECT role, content, created_at FROM messages
+                WHERE session_id = ? ORDER BY id DESC LIMIT ?""",
                 (session_id, limit)
             ).fetchall()
-
             return [
                 {
                     "role": row["role"],
@@ -137,142 +119,104 @@ def delete_history(session_id):
             connection.close()
 
 
-def build_prompt(history, message):
-    contents = []
-
-    for item in history:
-        if item["role"] not in ("user", "assistant"):
-            continue
-
-        role = "user" if item["role"] == "user" else "model"
-
-        contents.append({
-            "role": role,
-            "parts": [{"text": item["content"]}]
-        })
-
-    contents.append({
-        "role": "user",
-        "parts": [{"text": message}]
-    })
-
-    return contents
-
-
-def call_gemini(history, message):
+def call_openrouter(history, message):
     if not API_KEY:
         raise RuntimeError(
-            "Gemini API key is missing. Add GEMINI_API_KEY in Render environment variables."
+            "OpenRouter API key is missing. Add OPENROUTER_API_KEY in Render."
         )
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        + MODEL
-        + ":generateContent?key="
-        + API_KEY
-    )
-
-    system_instruction = """
+    system_prompt = """
 You are Hira AI, a friendly, helpful, smart AI study and career assistant.
 
 PERSONALITY:
 - Be caring, encouraging, funny when appropriate, and slightly playful.
-- Speak naturally. If the user speaks Hinglish or Roman Urdu, reply similarly.
+- If the user speaks Hinglish or Roman Urdu, reply similarly.
 - If the user writes in English, reply in English.
-- Keep answers clear and useful. Avoid unnecessarily long explanations.
-- Address the user naturally; do not repeatedly use their name.
+- Keep answers clear and useful without unnecessary length.
 
 WHAT YOU HELP WITH:
 - Python, Java, C, C++, HTML, CSS, JavaScript, SQL, DBMS and DSA.
 - AI, machine learning, beginner projects and debugging.
-- College assignments, exam preparation, quizzes and study plans.
-- Hackathons, internships, GitHub, resumes and career preparation.
-- General questions and everyday productivity.
+- College assignments, exams, study plans, hackathons and internships.
 
 CODING RULES:
-- When asked for a complete program, provide complete runnable code.
-- When asked to replace a file, provide the full replacement file.
+- Provide complete runnable programs when requested.
 - Explain errors in simple steps.
-- Never claim code has been executed or deployed unless that actually happened.
-- Do not invent test results, links, credentials or project status.
-
-SAFETY AND PRIVACY:
-- Never reveal API keys, secrets, environment variables or private server configuration.
-- Do not claim to access files, accounts or devices unless tools actually provide access.
-- If a question needs current information, clearly state uncertainty when you cannot verify it.
+- Never claim code was tested or deployed unless it actually was.
+- Never reveal API keys or private configuration.
 """
 
+    messages = [{"role": "system", "content": system_prompt}]
+
+    for item in history:
+        role = item.get("role")
+        content = item.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": message})
+
     payload = {
-        "systemInstruction": {
-            "parts": [{"text": system_instruction}]
-        },
-        "contents": build_prompt(history, message),
-        "generationConfig": {
-            "temperature": 0.75,
-            "topP": 0.95,
-            "maxOutputTokens": 4096
-        }
+        "model": MODEL,
+        "messages": messages,
+        "temperature": 0.7,
+        "max_tokens": 1500
     }
 
-    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": "Bearer " + API_KEY,
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://saara-06.github.io",
+            "X-OpenRouter-Title": "Hira AI"
+        },
+        method="POST"
+    )
 
-    last_error = "Gemini request failed."
+    try:
+        with urllib.request.urlopen(req, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
 
-    for attempt in range(3):
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
+        choices = result.get("choices", [])
+        if not choices:
+            raise RuntimeError("The AI returned no response. Please retry.")
 
-        try:
-            with urllib.request.urlopen(req, timeout=90) as response:
-                result = json.loads(response.read().decode("utf-8"))
-
-            candidates = result.get("candidates", [])
-            if not candidates:
-                raise RuntimeError(
-                    "The AI returned no response. Please try again."
-                )
-
-            parts = candidates[0].get("content", {}).get("parts", [])
+        answer = choices[0].get("message", {}).get("content", "")
+        if isinstance(answer, list):
             answer = "\n".join(
                 part.get("text", "")
-                for part in parts
-                if part.get("text")
-            ).strip()
+                for part in answer
+                if isinstance(part, dict) and part.get("text")
+            )
 
-            if not answer:
-                raise RuntimeError(
-                    "Hira received an empty response. Please try again."
-                )
+        answer = answer.strip() if isinstance(answer, str) else ""
+        if not answer:
+            raise RuntimeError("Hira received an empty response. Please retry.")
 
-            return answer
+        return answer
 
-        except urllib.error.HTTPError as error:
-            try:
-                details = error.read().decode("utf-8")
-                data = json.loads(details)
-                last_error = data.get("error", {}).get(
-                    "message", "Gemini API request failed."
-                )
-            except Exception:
-                last_error = "Gemini API request failed with HTTP " + str(error.code)
+    except urllib.error.HTTPError as error:
+        try:
+            details = json.loads(error.read().decode("utf-8"))
+            message = details.get("error", {}).get("message")
+            if not message:
+                message = str(details.get("error", "API request failed"))
+        except Exception:
+            message = "OpenRouter returned HTTP " + str(error.code)
 
-            if error.code not in (429, 500, 502, 503, 504):
-                raise RuntimeError(last_error)
+        app.logger.error("OpenRouter HTTP %s: %s", error.code, message)
+        raise RuntimeError(
+            "OpenRouter request failed (HTTP " + str(error.code) +
+            "). Check your API key, free-model availability and rate limits."
+        )
 
-        except (TimeoutError, urllib.error.URLError) as error:
-            last_error = "Connection timed out. Please try again."
+    except urllib.error.URLError:
+        raise RuntimeError("Could not connect to the AI service. Please retry.")
 
-        except json.JSONDecodeError:
-            last_error = "The AI returned an invalid response."
-
-        if attempt < 2:
-            time.sleep(1.5 * (attempt + 1))
-
-    raise RuntimeError(last_error)
+    except (TimeoutError, json.JSONDecodeError):
+        raise RuntimeError("The AI service timed out or returned invalid data.")
 
 
 @app.route("/", methods=["GET"])
@@ -288,6 +232,7 @@ def home():
 def health():
     return jsonify({
         "status": "ok",
+        "provider": "OpenRouter",
         "model": MODEL,
         "api_key_configured": bool(API_KEY),
         "history_storage": "SQLite"
@@ -297,7 +242,6 @@ def health():
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(silent=True) or {}
-
     message = data.get("message", "")
     session_id = data.get("session_id", "")
 
@@ -305,45 +249,34 @@ def chat():
         return jsonify({"error": "Message must be text."}), 400
 
     message = message.strip()
-
     if not message:
         return jsonify({"error": "Please enter a message."}), 400
 
     if len(message) > MAX_MESSAGE_LENGTH:
-        return jsonify({
-            "error": "Your message is too long. Please shorten it."
-        }), 400
+        return jsonify({"error": "Your message is too long."}), 400
 
     if not isinstance(session_id, str) or not session_id.strip():
         return jsonify({"error": "A session ID is required."}), 400
 
     session_id = session_id.strip()
-
     if len(session_id) > 100:
         return jsonify({"error": "Invalid session ID."}), 400
 
     try:
         history = read_history(session_id)
-        reply = call_gemini(history, message)
+        reply = call_openrouter(history, message)
 
         save_message(session_id, "user", message)
         save_message(session_id, "assistant", reply)
 
-        return jsonify({
-            "reply": reply,
-            "session_id": session_id
-        })
+        return jsonify({"reply": reply, "session_id": session_id})
 
     except RuntimeError as error:
-        return jsonify({
-            "error": str(error)
-        }), 503
+        return jsonify({"error": str(error)}), 503
 
     except Exception:
         app.logger.exception("Unexpected error in /chat")
-        return jsonify({
-            "error": "Something went wrong. Please try again."
-        }), 500
+        return jsonify({"error": "Something went wrong. Please retry."}), 500
 
 
 @app.route("/history/<session_id>", methods=["GET"])
@@ -363,11 +296,7 @@ def clear_history(session_id):
         return jsonify({"error": "Invalid session ID."}), 400
 
     delete_history(session_id)
-
-    return jsonify({
-        "success": True,
-        "session_id": session_id
-    })
+    return jsonify({"success": True, "session_id": session_id})
 
 
 @app.errorhandler(413)
@@ -376,7 +305,6 @@ def request_too_large(_error):
 
 
 init_db()
-
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
